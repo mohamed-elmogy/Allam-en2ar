@@ -1,4 +1,3 @@
-import argparse
 import os
 from datasets import load_dataset
 import torch
@@ -9,45 +8,46 @@ from transformers import (
     TrainingArguments,
     DataCollatorForLanguageModeling,
     TrainerCallback,
+    LlamaTokenizer,
 )
 from peft import LoraConfig
 from trl import SFTTrainer
+from huggingface_hub import login
 
-model_name = 'ALLaM-AI/ALLaM-7B-Instruct-preview'
-data_path = 'Data/data_preprocessed.csv'
-data_format = 'csv'
-en_col = 'en_clean'
-ar_col = 'ar_clean'
-output_dir = './allam-en2ar-lora'
-epochs = 3
-batch_size = 2
-grad_accum  = 16
-lr = 2e-4
-max_seq_len  = 1024
+# -----------------------------
+# Config
+# -----------------------------
+login(token="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")
+
+model_name   = "ALLaM-AI/ALLaM-7B-Instruct-preview"
+tokenizer_name = "ALLaM-AI/ALLaM-7B-Instruct-preview"
+Adapter_path = "./allam-en2ar-lora/lora_adapter"
+data_path    = "D:/Allam-en2ar-main/Data/train_data_preprocessed.csv"
+data_format  = "csv"
+en_col, ar_col = "en_clean", "ar_clean"
+output_dir   = "./allam-en2ar-lora-v4"
+eval_on = True
+epochs = 20
+batch_size = 8             # safer for memory
+grad_accum = 16
+lr = 5e-5
+max_seq_len = 512
 use_4bit = True
-weight_decay = 0
-warmup_ratio = 0
-logging_steps = 50
 fp16 = True
-eval_on = 'epochs'
-resume_from = 'ALLaM-AI/ALLaM-7B-Instruct-preview'
 
 # -----------------------------
 # Prompt Template
 # -----------------------------
 PROMPT_TEMPLATE = (
-    "Translate the following sentence from English to Arabic.\n\n"
-    "English: {source}\n"
-    "Arabic:"  # The answer (target) will be appended after this tag
+    "Translate English to Arabic:\n"
+    "<EN> {source}\n"
+    "<AR> {target} <EOS>"
 )
-
-RESPONSE_TAG = "Arabic:"  # Used by the collator to mask everything before the answer
-
 # -----------------------------
 # Dataset loading / processing
 # -----------------------------
 
-def load_translation_dataset(path: str, fmt: str, en_col: str, ar_col: str, args):
+def load_translation_dataset(path: str, fmt: str, en_col: str, ar_col: str):
     if fmt == "csv":
         ds = load_dataset("csv", data_files=path)
     elif fmt in ("json", "jsonl"):
@@ -64,8 +64,8 @@ def load_translation_dataset(path: str, fmt: str, en_col: str, ar_col: str, args
     def build_examples(example):
         src = str(example[en_col]).strip()
         tgt = str(example[ar_col]).strip()
-        prompt = PROMPT_TEMPLATE.format(source=src)
-        return {"text": f"{prompt} {tgt}"}
+        prompt = PROMPT_TEMPLATE.format(source=src, target=tgt)
+        return {"text": prompt}
 
     ds = ds.map(build_examples, remove_columns=ds["train"].column_names)
     if "validation" not in ds and eval_on:
@@ -74,6 +74,12 @@ def load_translation_dataset(path: str, fmt: str, en_col: str, ar_col: str, args
     return ds
 
 
+def build_examples(example):
+    src = str(example[en_col]).strip()
+    tgt = str(example[ar_col]).strip()
+    prompt = PROMPT_TEMPLATE.format(source=src, target=tgt)
+    return {"text": prompt}
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -81,7 +87,7 @@ def load_translation_dataset(path: str, fmt: str, en_col: str, ar_col: str, args
 def main():
    
     # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tokenizer = LlamaTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -104,15 +110,20 @@ def main():
         device_map=device_map,
         quantization_config=quant_config,
     )
+    special_tokens = {"additional_special_tokens": ["<EN>", "<AR>", "<EOS>"]}
+    tokenizer.add_special_tokens(special_tokens)
 
+    # Resize model embeddings to handle new tokens
+    model.resize_token_embeddings(len(tokenizer))
     # LoRA config
     peft_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
+        r=32,
+        lora_alpha=64,
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "v_proj"]
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
     )
 
     # Dataset
@@ -127,8 +138,8 @@ def main():
     per_device_eval_batch_size=batch_size,
     gradient_accumulation_steps=grad_accum,
     learning_rate=lr,
-    weight_decay=weight_decay,
-    warmup_ratio=warmup_ratio,
+    weight_decay=0,
+    warmup_ratio=0,
     logging_strategy="steps",
     logging_steps=50,                 # adjust as needed
     optim="paged_adamw_32bit",
@@ -137,23 +148,16 @@ def main():
     fp16=fp16,
     dataloader_pin_memory=True,
     dataloader_num_workers=2,
-    save_strategy="epoch",
-    evaluation_strategy="epoch",
-    load_best_model_at_end=True,
     report_to=["tensorboard"],
     )
 
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
         peft_config=peft_config,
         args=train_args,
         train_dataset=ds["train"],
         eval_dataset=(ds.get("validation") if eval_on else None),
-        dataset_text_field="text",
-        packing=False,
-        max_seq_length=max_seq_len,
         data_collator=collator,
     )
     class PrintMetricsCallback(TrainerCallback):
@@ -162,7 +166,7 @@ def main():
                 print(f"Step {state.global_step} - Loss: {logs.get('loss')}, Eval Loss: {logs.get('eval_loss')}")
                 
     trainer.add_callback(PrintMetricsCallback)
-    trainer.train(resume_from_checkpoint=resume_from)
+    trainer.train()
 
     trainer.model.save_pretrained(os.path.join(output_dir, "lora_adapter"))
     tokenizer.save_pretrained(output_dir)
