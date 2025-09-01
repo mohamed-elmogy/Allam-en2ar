@@ -17,7 +17,7 @@ from huggingface_hub import login
 # -----------------------------
 # Config
 # -----------------------------
-login(token="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")
+login(token="Add your Hugging face token here")
 
 model_name   = "ALLaM-AI/ALLaM-7B-Instruct-preview"
 tokenizer_name = "ALLaM-AI/ALLaM-7B-Instruct-preview"
